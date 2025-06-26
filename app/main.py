@@ -334,13 +334,18 @@ def generar_reporte_pdf(sesion_id: int):
     try:
         conn = get_connection()
         cursor = conn.cursor(dictionary=True)
-        # Obtener datos de la sesión
-        cursor.execute("SELECT nombre, fecha FROM sesiones WHERE id = %s", (sesion_id,))
+        # Verificar si la sesión está finalizada
+        cursor.execute("SELECT nombre, fecha, finalizada FROM sesiones WHERE id = %s", (sesion_id,))
         sesion = cursor.fetchone()
         if not sesion:
             cursor.close()
             conn.close()
             raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        finalizada = sesion['finalizada'] if isinstance(sesion, dict) else sesion[2]
+        if not finalizada:
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Solo se puede descargar el PDF de sesiones finalizadas.")
         # Obtener lista de alumnos y su estado de asistencia
         cursor.execute('''
             SELECT a.nombre, a.apellido, a.codigo, a.correo, asis.estado
@@ -355,7 +360,6 @@ def generar_reporte_pdf(sesion_id: int):
         buffer = sysio.BytesIO()
         p = canvas.Canvas(buffer, pagesize=letter)
         width, height = letter
-        # Acceso robusto a los campos de sesión
         nombre_sesion = sesion['nombre'] if isinstance(sesion, dict) else str(sesion[0])
         fecha_sesion = sesion['fecha'] if isinstance(sesion, dict) else str(sesion[1])
         p.setFont("Helvetica-Bold", 16)
@@ -373,7 +377,6 @@ def generar_reporte_pdf(sesion_id: int):
         y -= 20
         p.setFont("Helvetica", 10)
         for alumno in alumnos:
-            # Acceso robusto a los campos de alumno
             nombre = alumno['nombre'] if isinstance(alumno, dict) else str(alumno[0])
             apellido = alumno['apellido'] if isinstance(alumno, dict) else str(alumno[1])
             codigo = alumno['codigo'] if isinstance(alumno, dict) else str(alumno[2])
@@ -393,5 +396,149 @@ def generar_reporte_pdf(sesion_id: int):
         return StreamingResponse(buffer, media_type="application/pdf", headers={
             "Content-Disposition": f"attachment; filename=reporte_sesion_{sesion_id}.pdf"
         })
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/alumnos/{alumno_id}")
+async def editar_alumno(
+    alumno_id: int,
+    nombre: str = Form(None),
+    apellido: str = Form(None),
+    codigo: str = Form(None),
+    correo: str = Form(None),
+    foto: UploadFile = File(None)
+):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        campos = []
+        valores = []
+        if nombre is not None:
+            campos.append("nombre=%s")
+            valores.append(nombre)
+        if apellido is not None:
+            campos.append("apellido=%s")
+            valores.append(apellido)
+        if codigo is not None:
+            campos.append("codigo=%s")
+            valores.append(codigo)
+        if correo is not None:
+            campos.append("correo=%s")
+            valores.append(correo)
+        if foto is not None:
+            foto_bytes = await foto.read()
+            image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
+            image_np = np.array(image)
+            image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+            cascade_path = "models/haarcascade_frontalface_default.xml"
+            face_cascade = cv2.CascadeClassifier(cascade_path)
+            faces = face_cascade.detectMultiScale(image_cv, scaleFactor=1.1, minNeighbors=5)
+            if len(faces) == 0:
+                raise HTTPException(status_code=400, detail="No se detectó ningún rostro en la imagen.")
+            (x, y, w, h) = faces[0]
+            rostro = image_cv[y:y+h, x:x+w]
+            _, buffer = cv2.imencode('.jpg', rostro)
+            rostro_bytes = buffer.tobytes()
+            rostro_rgb = cv2.cvtColor(rostro, cv2.COLOR_BGR2RGB)
+            rostro_pil = Image.fromarray(rostro_rgb)
+            rostro_tensor = preprocess(rostro_pil)
+            if not isinstance(rostro_tensor, torch.Tensor):
+                raise HTTPException(status_code=500, detail="Error al convertir la imagen a tensor")
+            rostro_tensor = torch.unsqueeze(rostro_tensor, 0)
+            with torch.no_grad():
+                embedding_tensor = resnet_model(rostro_tensor)
+            embedding_np = embedding_tensor.squeeze().numpy()
+            embedding_bytes = embedding_np.tobytes()
+            campos.append("foto=%s")
+            valores.append(rostro_bytes)
+            campos.append("embedding=%s")
+            valores.append(embedding_bytes)
+        if not campos:
+            cursor.close()
+            conn.close()
+            return {"success": False, "message": "No se enviaron datos para actualizar"}
+        sql = f"UPDATE alumnos SET {', '.join(campos)} WHERE id=%s"
+        valores.append(alumno_id)
+        cursor.execute(sql, tuple(valores))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"success": True, "message": "Alumno actualizado correctamente"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/alumnos/{alumno_id}")
+def eliminar_alumno(alumno_id: int):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Eliminar asistencias del alumno
+        cursor.execute("DELETE FROM asistencias WHERE alumno_id = %s", (alumno_id,))
+        # Eliminar el alumno
+        cursor.execute("DELETE FROM alumnos WHERE id = %s", (alumno_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"success": True, "message": "Alumno eliminado correctamente"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.put("/sesiones/{sesion_id}")
+def editar_sesion(sesion_id: int, nombre: str = Form(...)):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Verificar si la sesión está finalizada
+        cursor.execute("SELECT finalizada FROM sesiones WHERE id = %s", (sesion_id,))
+        sesion = cursor.fetchone()
+        if not sesion:
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        finalizada = sesion[0] if isinstance(sesion, (tuple, list)) else sesion['finalizada']
+        if finalizada:
+            cursor.close()
+            conn.close()
+            return {"success": False, "message": "No se puede editar una sesión finalizada"}
+        cursor.execute("UPDATE sesiones SET nombre = %s WHERE id = %s", (nombre, sesion_id))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"success": True, "message": "Sesión actualizada correctamente"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.delete("/sesiones/{sesion_id}")
+def eliminar_sesion(sesion_id: int):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        # Eliminar asistencias de la sesión
+        cursor.execute("DELETE FROM asistencias WHERE sesion_id = %s", (sesion_id,))
+        # Eliminar la sesión
+        cursor.execute("DELETE FROM sesiones WHERE id = %s", (sesion_id,))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {"success": True, "message": "Sesión eliminada correctamente"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/alumnos/{alumno_id}/asistencias")
+def listar_asistencias_alumno(alumno_id: int):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute('''
+            SELECT s.id as sesion_id, s.nombre as sesion_nombre, s.fecha, s.finalizada, a.estado
+            FROM sesiones s
+            JOIN asistencias a ON s.id = a.sesion_id
+            WHERE a.alumno_id = %s
+            ORDER BY s.fecha DESC
+        ''', (alumno_id,))
+        asistencias = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {"success": True, "asistencias": asistencias}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
