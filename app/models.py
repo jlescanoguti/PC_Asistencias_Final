@@ -25,8 +25,17 @@ class SimpleCNN(nn.Module):
         x = self.fc2(x)
         return x
 
-# Transformaciones para imágenes
-transform = transforms.Compose([
+# Transformaciones para imágenes (con data augmentation para entrenamiento)
+train_transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.RandomHorizontalFlip(),
+    transforms.RandomRotation(20),
+    transforms.ColorJitter(brightness=0.3, contrast=0.3),
+    transforms.ToTensor(),
+])
+
+# Transformación para validación/predicción (sin augmentation)
+predict_transform = transforms.Compose([
     transforms.Resize((224, 224)),
     transforms.ToTensor(),
 ])
@@ -41,10 +50,10 @@ def get_cnn_model(num_classes):
 # lr: learning rate
 
 def train_cnn_model(image_dir, model_path, epochs=10, lr=0.001):
-    # Crear dataset
+    # Crear dataset con data augmentation
     dataset = datasets.ImageFolder(
         image_dir,
-        transform=transform
+        transform=train_transform
     )
     dataloader = DataLoader(dataset, batch_size=4, shuffle=True)
     num_classes = len(dataset.classes)
@@ -78,7 +87,7 @@ def predict_cnn_model(image_path, model_path):
     model.load_state_dict(checkpoint['model_state_dict'])
     model.eval()
     image = Image.open(image_path).convert('RGB')
-    tensor = transform(image)
+    tensor = predict_transform(image)
     if not isinstance(tensor, torch.Tensor):
         raise Exception('El resultado de transform no es un tensor de PyTorch')
     input_tensor = tensor.unsqueeze(0)
