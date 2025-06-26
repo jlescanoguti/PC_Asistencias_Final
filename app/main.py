@@ -11,6 +11,8 @@ from fastapi.responses import StreamingResponse
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import io as sysio
+import os
+from app.models import train_cnn_model, predict_cnn_model
 
 app = FastAPI()
 
@@ -67,43 +69,34 @@ async def registrar_alumno(
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-
     # Convertir los bytes a una imagen de OpenCV
     image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
     image_np = np.array(image)
     image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-
     # Cargar el clasificador Haar
     cascade_path = "models/haarcascade_frontalface_default.xml"
     face_cascade = cv2.CascadeClassifier(cascade_path)
-
     # Detectar rostros
     faces = face_cascade.detectMultiScale(image_cv, scaleFactor=1.1, minNeighbors=5)
-
     if len(faces) == 0:
         raise HTTPException(status_code=400, detail="No se detectó ningún rostro en la imagen.")
-
     # Tomar el primer rostro detectado
     (x, y, w, h) = faces[0]
     rostro = image_cv[y:y+h, x:x+w]
-
-    # Convertir el rostro recortado a bytes para guardar (opcional)
+    # Guardar el rostro recortado en app/alumnos_img/{codigo}/1.jpg
+    img_dir = os.path.join("app", "alumnos_img", codigo)
+    os.makedirs(img_dir, exist_ok=True)
+    img_path = os.path.join(img_dir, "1.jpg")
+    cv2.imwrite(img_path, rostro)
+    # Entrenar el modelo CNN con todas las imágenes
+    model_dir = os.path.join("app", "modelos")
+    os.makedirs(model_dir, exist_ok=True)
+    model_path = os.path.join(model_dir, "modelo_cnn.pth")
+    train_cnn_model("app/alumnos_img", model_path, epochs=10)
+    # Guardar en la base de datos (foto y embedding vacío)
     _, buffer = cv2.imencode('.jpg', rostro)
     rostro_bytes = buffer.tobytes()
-
-    # Obtener el embedding facial usando ResNet18
-    rostro_rgb = cv2.cvtColor(rostro, cv2.COLOR_BGR2RGB)
-    rostro_pil = Image.fromarray(rostro_rgb)
-    rostro_tensor = preprocess(rostro_pil)
-    print('Tipo de rostro_tensor:', type(rostro_tensor))  # Depuración
-    if not isinstance(rostro_tensor, torch.Tensor):
-        raise HTTPException(status_code=500, detail="Error al convertir la imagen a tensor")
-    rostro_tensor = torch.unsqueeze(rostro_tensor, 0)  # Añadir batch dimension
-    with torch.no_grad():
-        embedding_tensor = resnet_model(rostro_tensor)
-    embedding_np = embedding_tensor.squeeze().numpy()  # (512,)
-    embedding_bytes = embedding_np.tobytes()
-
+    embedding = b''  # No se usa embedding, pero se mantiene el campo
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -111,7 +104,7 @@ async def registrar_alumno(
             INSERT INTO alumnos (nombre, apellido, codigo, correo, foto, embedding)
             VALUES (%s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (nombre, apellido, codigo, correo, rostro_bytes, embedding_bytes))
+        cursor.execute(sql, (nombre, apellido, codigo, correo, rostro_bytes, embedding))
         conn.commit()
         cursor.close()
         conn.close()
@@ -261,90 +254,67 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
         conn.close()
         # Leer la foto como bytes
         foto_bytes = await foto.read()
-        # Convertir los bytes a una imagen de OpenCV
         image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
         image_np = np.array(image)
         image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-        # Cargar el clasificador Haar
         cascade_path = "models/haarcascade_frontalface_default.xml"
         face_cascade = cv2.CascadeClassifier(cascade_path)
-        # Detectar rostros
         faces = face_cascade.detectMultiScale(image_cv, scaleFactor=1.1, minNeighbors=5)
         if len(faces) == 0:
             raise HTTPException(status_code=400, detail="No se detectó ningún rostro en la imagen.")
-        # Tomar el primer rostro detectado
         (x, y, w, h) = faces[0]
         rostro = image_cv[y:y+h, x:x+w]
-        # Obtener el embedding facial usando ResNet18
-        rostro_rgb = cv2.cvtColor(rostro, cv2.COLOR_BGR2RGB)
-        rostro_pil = Image.fromarray(rostro_rgb)
-        rostro_tensor = preprocess(rostro_pil)
-        if not isinstance(rostro_tensor, torch.Tensor):
-            raise HTTPException(status_code=500, detail="Error al convertir la imagen a tensor")
-        rostro_tensor = torch.unsqueeze(rostro_tensor, 0)
-        with torch.no_grad():
-            embedding_tensor = resnet_model(rostro_tensor)
-        embedding_np = embedding_tensor.squeeze().numpy()  # (512,)
-        # Buscar alumnos de la sesión y comparar embeddings
+        # Guardar rostro temporalmente
+        temp_path = os.path.join("app", "alumnos_img", "temp.jpg")
+        cv2.imwrite(temp_path, rostro)
+        # Predecir el código del alumno usando el modelo CNN
+        model_path = os.path.join("app", "modelos", "modelo_cnn.pth")
+        if not os.path.exists(model_path):
+            raise HTTPException(status_code=500, detail="Modelo de reconocimiento no entrenado.")
+        codigo_predicho, prob = predict_cnn_model(temp_path, model_path)
+        os.remove(temp_path)
+        umbral = 0.7
+        if prob < umbral:
+            return {"success": False, "message": "No se pudo identificar al alumno con suficiente confianza."}
+        # Buscar el alumno por código y marcar asistencia
         conn = get_connection()
         cursor = conn.cursor()
+        cursor.execute("SELECT id, nombre FROM alumnos WHERE codigo = %s", (codigo_predicho,))
+        alumno = cursor.fetchone()
+        if not alumno:
+            cursor.close()
+            conn.close()
+            return {"success": False, "message": "Alumno identificado no encontrado en la base de datos."}
+        alumno_id, nombre = alumno
+        # Solo permite int, str o float para conversión segura
+        if not isinstance(alumno_id, (int, str, float)) or not isinstance(sesion_id, (int, str, float)):
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=500, detail="ID de alumno o sesión no convertible a entero")
+        try:
+            alumno_id_final = int(alumno_id)
+            sesion_id_final = int(sesion_id)
+        except Exception:
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=500, detail="ID de alumno o sesión no convertible a entero")
         cursor.execute('''
-            SELECT a.id, a.nombre, a.codigo, a.embedding
-            FROM alumnos a
-            JOIN asistencias asis ON a.id = asis.alumno_id
-            WHERE asis.sesion_id = %s
-        ''', (sesion_id,))
-        alumnos = cursor.fetchall()
-        min_dist = float('inf')
-        alumno_identificado = None
-        umbral = 0.7  # Puedes ajustar este valor según pruebas
-        for alumno in alumnos:
-            alumno_id, nombre, codigo, embedding_bytes = alumno
-            if not isinstance(embedding_bytes, (bytes, bytearray)):
-                continue
-            alumno_embedding = np.frombuffer(embedding_bytes, dtype=np.float32)
-            if alumno_embedding.shape != embedding_np.shape:
-                continue
-            dist = np.linalg.norm(embedding_np - alumno_embedding)
-            if dist < min_dist:
-                min_dist = dist
-                alumno_identificado = (alumno_id, nombre, codigo)
-        if alumno_identificado and min_dist < umbral:
-            # Marcar asistencia como 'Asistió'
-            alumno_id_raw = alumno_identificado[0]
-            sesion_id_raw = sesion_id
-            # Solo permite int, str o float para conversión segura
-            if not isinstance(alumno_id_raw, (int, str, float)) or not isinstance(sesion_id_raw, (int, str, float)):
-                cursor.close()
-                conn.close()
-                raise HTTPException(status_code=500, detail="ID de alumno o sesión no convertible a entero")
-            try:
-                alumno_id_final = int(alumno_id_raw)
-                sesion_id_final = int(sesion_id_raw)
-            except Exception:
-                cursor.close()
-                conn.close()
-                raise HTTPException(status_code=500, detail="ID de alumno o sesión no convertible a entero")
-            cursor.execute('''
-                UPDATE asistencias SET estado = 'Asistió'
-                WHERE sesion_id = %s AND alumno_id = %s
-            ''', (sesion_id_final, alumno_id_final))
-            conn.commit()
-            cursor.close()
-            conn.close()
-            return {
-                "success": True,
-                "message": "Asistencia registrada",
-                "alumno": {
-                    "id": alumno_id_final,
-                    "nombre": alumno_identificado[1],
-                    "codigo": alumno_identificado[2]
-                }
+            UPDATE asistencias SET estado = 'Asistió'
+            WHERE sesion_id = %s AND alumno_id = %s
+        ''', (sesion_id_final, alumno_id_final))
+        conn.commit()
+        cursor.close()
+        conn.close()
+        return {
+            "success": True,
+            "message": "Asistencia registrada",
+            "alumno": {
+                "id": alumno_id,
+                "nombre": nombre,
+                "codigo": codigo_predicho,
+                "probabilidad": prob
             }
-        else:
-            cursor.close()
-            conn.close()
-            return {"success": False, "message": "No se pudo identificar al alumno"}
+        }
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
