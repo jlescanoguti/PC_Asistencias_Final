@@ -54,6 +54,19 @@ async def registrar_alumno(
 ):
     # Leer la foto como bytes
     foto_bytes = await foto.read()
+    # Validar que no exista un alumno con el mismo código o correo
+    try:
+        conn = get_connection()
+        cursor = conn.cursor()
+        cursor.execute("SELECT id FROM alumnos WHERE codigo = %s OR correo = %s", (codigo, correo))
+        if cursor.fetchone():
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Ya existe un alumno con ese código o correo.")
+        cursor.close()
+        conn.close()
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # Convertir los bytes a una imagen de OpenCV
     image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
@@ -130,6 +143,12 @@ def crear_sesion(nombre: str = Form(...)):
     try:
         conn = get_connection()
         cursor = conn.cursor()
+        # Validar que no exista una sesión con el mismo nombre
+        cursor.execute("SELECT id FROM sesiones WHERE nombre = %s", (nombre,))
+        if cursor.fetchone():
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=400, detail="Ya existe una sesión con ese nombre.")
         # Obtener todos los alumnos
         cursor.execute("SELECT id FROM alumnos")
         alumnos = cursor.fetchall()
