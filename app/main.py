@@ -7,6 +7,10 @@ from PIL import Image
 import torch
 import torchvision.transforms as transforms
 from torchvision.models import resnet18
+from fastapi.responses import StreamingResponse
+from reportlab.lib.pagesizes import letter
+from reportlab.pdfgen import canvas
+import io as sysio
 
 app = FastAPI()
 
@@ -322,5 +326,72 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
             cursor.close()
             conn.close()
             return {"success": False, "message": "No se pudo identificar al alumno"}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/sesiones/{sesion_id}/reporte-pdf")
+def generar_reporte_pdf(sesion_id: int):
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        # Obtener datos de la sesión
+        cursor.execute("SELECT nombre, fecha FROM sesiones WHERE id = %s", (sesion_id,))
+        sesion = cursor.fetchone()
+        if not sesion:
+            cursor.close()
+            conn.close()
+            raise HTTPException(status_code=404, detail="Sesión no encontrada")
+        # Obtener lista de alumnos y su estado de asistencia
+        cursor.execute('''
+            SELECT a.nombre, a.apellido, a.codigo, a.correo, asis.estado
+            FROM alumnos a
+            JOIN asistencias asis ON a.id = asis.alumno_id
+            WHERE asis.sesion_id = %s
+        ''', (sesion_id,))
+        alumnos = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        # Crear PDF en memoria
+        buffer = sysio.BytesIO()
+        p = canvas.Canvas(buffer, pagesize=letter)
+        width, height = letter
+        # Acceso robusto a los campos de sesión
+        nombre_sesion = sesion['nombre'] if isinstance(sesion, dict) else str(sesion[0])
+        fecha_sesion = sesion['fecha'] if isinstance(sesion, dict) else str(sesion[1])
+        p.setFont("Helvetica-Bold", 16)
+        p.drawString(50, height - 50, f"Reporte de Asistencia - {nombre_sesion}")
+        p.setFont("Helvetica", 12)
+        p.drawString(50, height - 70, f"Fecha: {fecha_sesion}")
+        # Encabezados de tabla
+        y = height - 110
+        p.setFont("Helvetica-Bold", 11)
+        p.drawString(50, y, "Nombre")
+        p.drawString(180, y, "Apellido")
+        p.drawString(310, y, "Código")
+        p.drawString(400, y, "Correo")
+        p.drawString(520, y, "Estado")
+        y -= 20
+        p.setFont("Helvetica", 10)
+        for alumno in alumnos:
+            # Acceso robusto a los campos de alumno
+            nombre = alumno['nombre'] if isinstance(alumno, dict) else str(alumno[0])
+            apellido = alumno['apellido'] if isinstance(alumno, dict) else str(alumno[1])
+            codigo = alumno['codigo'] if isinstance(alumno, dict) else str(alumno[2])
+            correo = alumno['correo'] if isinstance(alumno, dict) else str(alumno[3])
+            estado = alumno['estado'] if isinstance(alumno, dict) else str(alumno[4])
+            if y < 50:
+                p.showPage()
+                y = height - 50
+            p.drawString(50, y, str(nombre))
+            p.drawString(180, y, str(apellido))
+            p.drawString(310, y, str(codigo))
+            p.drawString(400, y, str(correo))
+            p.drawString(520, y, str(estado))
+            y -= 18
+        p.save()
+        buffer.seek(0)
+        return StreamingResponse(buffer, media_type="application/pdf", headers={
+            "Content-Disposition": f"attachment; filename=reporte_sesion_{sesion_id}.pdf"
+        })
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
