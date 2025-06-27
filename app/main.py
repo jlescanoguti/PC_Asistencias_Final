@@ -12,7 +12,8 @@ from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import io as sysio
 import os
-from app.models import train_cnn_model, predict_cnn_model
+from app.models import train_cnn_model, predict_cnn_model, direct_image_comparison
+from torchvision import transforms
 
 app = FastAPI()
 
@@ -83,16 +84,30 @@ async def registrar_alumno(
     # Tomar el primer rostro detectado
     (x, y, w, h) = faces[0]
     rostro = image_cv[y:y+h, x:x+w]
-    # Guardar el rostro recortado en app/alumnos_img/{codigo}/1.jpg
+    # Guardar 5 imágenes augmentadas en app/alumnos_img/{codigo}/
     img_dir = os.path.join("app", "alumnos_img", codigo)
     os.makedirs(img_dir, exist_ok=True)
-    img_path = os.path.join(img_dir, "1.jpg")
-    cv2.imwrite(img_path, rostro)
+    # Definir transformaciones de augmentation (más suaves)
+    augmentation = transforms.Compose([
+        transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
+        transforms.RandomHorizontalFlip(),
+        transforms.RandomRotation(10),
+        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
+        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), shear=5),
+        transforms.GaussianBlur(3, sigma=(0.1, 0.5)),
+        transforms.ToTensor(),
+    ])
+    for i in range(1, 4):
+        rostro_pil = Image.fromarray(cv2.cvtColor(rostro, cv2.COLOR_BGR2RGB))
+        img_aug = augmentation(rostro_pil)
+        img_aug_pil = transforms.ToPILImage()(img_aug)
+        img_path = os.path.join(img_dir, f"{i}.jpg")
+        img_aug_pil.save(img_path)
     # Entrenar el modelo CNN con todas las imágenes
     model_dir = os.path.join("app", "modelos")
     os.makedirs(model_dir, exist_ok=True)
     model_path = os.path.join(model_dir, "modelo_cnn.pth")
-    train_cnn_model("app/alumnos_img", model_path, epochs=10)
+    train_cnn_model("app/alumnos_img", model_path, epochs=25)
     # Guardar en la base de datos (foto y embedding vacío)
     _, buffer = cv2.imencode('.jpg', rostro)
     rostro_bytes = buffer.tobytes()
@@ -245,7 +260,7 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
             cursor.close()
             conn.close()
             raise HTTPException(status_code=404, detail="Sesión no encontrada")
-        finalizada = sesion[0] if isinstance(sesion, (tuple, list)) else sesion['finalizada']
+        finalizada = sesion[0] if isinstance(sesion, (tuple, list)) and len(sesion) > 0 else sesion.get('finalizada') if isinstance(sesion, dict) else None
         if finalizada:
             cursor.close()
             conn.close()
@@ -267,15 +282,40 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
         # Guardar rostro temporalmente
         temp_path = os.path.join("app", "alumnos_img", "temp.jpg")
         cv2.imwrite(temp_path, rostro)
-        # Predecir el código del alumno usando el modelo CNN
-        model_path = os.path.join("app", "modelos", "modelo_cnn.pth")
-        if not os.path.exists(model_path):
-            raise HTTPException(status_code=500, detail="Modelo de reconocimiento no entrenado.")
-        codigo_predicho, prob = predict_cnn_model(temp_path, model_path)
+        
+        # Estrategia híbrida: Comparación directa + CNN como respaldo
+        codigo_predicho = None
+        prob = 0.0
+        metodo_usado = "Ninguno"
+        
+        # 1. Intentar comparación directa
+        try:
+            codigo_directo, score_directo, metodo_directo = direct_image_comparison(temp_path, "app/alumnos_img")
+            if codigo_directo and isinstance(score_directo, (int, float)) and float(score_directo) > 0.75:  # Umbral más estricto para SSIM
+                codigo_predicho = codigo_directo
+                prob = float(score_directo)
+                metodo_usado = f"Comparación directa ({metodo_directo})"
+        except Exception as e:
+            print(f"Error en comparación directa: {e}")
+        
+        # 2. Si comparación directa no funcionó, usar CNN
+        if not codigo_predicho:
+            model_path = os.path.join("app", "modelos", "modelo_cnn.pth")
+            if os.path.exists(model_path):
+                try:
+                    codigo_cnn, prob_cnn = predict_cnn_model(temp_path, model_path)
+                    if isinstance(prob_cnn, (int, float)) and float(prob_cnn) > 0.5:  # Umbral más bajo para CNN
+                        codigo_predicho = codigo_cnn
+                        prob = float(prob_cnn)
+                        metodo_usado = "Modelo CNN"
+                except Exception as e:
+                    print(f"Error en predicción CNN: {e}")
+        
         os.remove(temp_path)
-        umbral = 0.7
-        if prob < umbral:
+        
+        if not codigo_predicho or not isinstance(prob, (int, float)) or float(prob) < 0.5:
             return {"success": False, "message": "No se pudo identificar al alumno con suficiente confianza."}
+        
         # Buscar el alumno por código y marcar asistencia
         conn = get_connection()
         cursor = conn.cursor()
@@ -309,10 +349,11 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
             "success": True,
             "message": "Asistencia registrada",
             "alumno": {
-                "id": alumno_id,
+                "id": alumno_id_final,
                 "nombre": nombre,
                 "codigo": codigo_predicho,
-                "probabilidad": prob
+                "probabilidad": prob,
+                "metodo": metodo_usado
             }
         }
     except Exception as e:
