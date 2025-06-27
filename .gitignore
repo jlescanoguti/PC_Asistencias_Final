@@ -3,7 +3,6 @@ __pycache__/
 *.pyc
 
 # Entorno virtual
-venv311/
 .env
 
 # Imágenes y datos generados en runtime
