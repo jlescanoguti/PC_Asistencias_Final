@@ -44,35 +44,45 @@ async def registrar_alumno(
     try:
         conn = get_connection()
         cursor = conn.cursor()
-        cursor.execute("SELECT id FROM alumnos WHERE codigo = %s OR correo = %s", (codigo, correo))
-        if cursor.fetchone():
+        cursor.execute("SELECT id, codigo, correo, embedding FROM alumnos")
+        alumnos = cursor.fetchall()
+        # Convertir los bytes a una imagen de OpenCV
+        image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
+        image_np = np.array(image)
+        image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
+        # Extraer embedding facial
+        embedding = get_face_embedding(image_cv)
+        if embedding is None:
             cursor.close()
             conn.close()
-            raise HTTPException(status_code=400, detail="Ya existe un alumno con ese código o correo.")
+            raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial. Asegúrate de que el rostro esté bien visible y centrado.")
+        embedding_bytes = embedding.astype(np.float32).tobytes()
+        # Validar código y correo
+        for alumno in alumnos:
+            _, cod, mail, emb_blob = alumno
+            if cod == codigo or mail == correo:
+                cursor.close()
+                conn.close()
+                raise HTTPException(status_code=400, detail="Ya existe un alumno con ese código o correo.")
+            # Validar rostro duplicado
+            if emb_blob is not None:
+                emb_np = np.frombuffer(emb_blob, dtype=np.float32)
+                if emb_np.shape[0] == embedding.shape[0]:
+                    score = cosine_similarity(embedding, emb_np)
+                    if score > 0.6:
+                        cursor.close()
+                        conn.close()
+                        raise HTTPException(status_code=400, detail=f"El rostro ya está registrado para otro alumno (código: {cod}, correo: {mail})")
         cursor.close()
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # Convertir los bytes a una imagen de OpenCV
-    image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
-    image_np = np.array(image)
-    image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-    # Extraer embedding facial
-    embedding = get_face_embedding(image_cv)
-    if embedding is None:
-        raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial. Asegúrate de que el rostro esté bien visible y centrado.")
-    embedding_bytes = embedding.astype(np.float32).tobytes()
     # Guardar imágenes preprocesadas augmentadas en app/alumnos_img/{codigo}/
     img_dir = os.path.join("app", "alumnos_img", codigo)
     os.makedirs(img_dir, exist_ok=True)
     # Guardar la imagen original (opcional)
     original_path = os.path.join(img_dir, "original.jpg")
     cv2.imwrite(original_path, image_cv)
-    # Entrenar el modelo CNN (opcional, puedes comentar si solo usas embeddings)
-    # model_dir = os.path.join("app", "modelos")
-    # os.makedirs(model_dir, exist_ok=True)
-    # model_path = os.path.join(model_dir, "modelo_cnn.pth")
-    # train_cnn_model("app/alumnos_img", model_path, epochs=25)
     # Guardar en la base de datos (foto original y embedding)
     _, buffer = cv2.imencode('.jpg', image_cv)
     rostro_bytes = buffer.tobytes()
@@ -229,9 +239,6 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
             cursor.close()
             conn.close()
             return {"success": False, "message": "No se puede pasar asistencia. La sesión ya está finalizada."}
-        cursor.close()
-        conn.close()
-        
         # Leer la foto como bytes
         foto_bytes = await foto.read()
         image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
@@ -240,9 +247,10 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
         # Extraer embedding facial de la imagen de prueba
         test_embedding = get_face_embedding(image_cv)
         if test_embedding is None:
+            cursor.close()
+            conn.close()
             raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial de la imagen de asistencia.")
         # Buscar todos los alumnos y comparar embeddings
-        cursor = conn.cursor()
         cursor.execute("SELECT id, nombre, codigo, embedding FROM alumnos")
         alumnos = cursor.fetchall()
         best_score = -1
@@ -260,18 +268,25 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
                 best_alumno = (alumno_id, nombre, codigo)
         # Umbral de similitud (ajustable, típico: 0.5-0.6)
         if best_score < 0.5 or best_alumno is None:
+            cursor.close()
+            conn.close()
             return {"success": False, "message": "No se pudo identificar al alumno con suficiente confianza."}
         alumno_id, nombre, codigo = best_alumno
+        # Validar si ya tiene asistencia registrada
+        cursor.execute('''SELECT estado FROM asistencias WHERE sesion_id = %s AND alumno_id = %s''', (sesion_id, alumno_id))
+        asistencia = cursor.fetchone()
+        if asistencia and asistencia[0] == 'Asistió':
+            cursor.close()
+            conn.close()
+            return {"success": False, "message": "La asistencia ya fue registrada para este alumno en esta sesión."}
         # Marcar asistencia
-        conn2 = get_connection()
-        cursor2 = conn2.cursor()
-        cursor2.execute('''
+        cursor.execute('''
             UPDATE asistencias SET estado = 'Asistió'
             WHERE sesion_id = %s AND alumno_id = %s
         ''', (sesion_id, alumno_id))
-        conn2.commit()
-        cursor2.close()
-        conn2.close()
+        conn.commit()
+        cursor.close()
+        conn.close()
         return {
             "success": True,
             "message": "Asistencia registrada con embedding facial",
