@@ -4,31 +4,14 @@ import numpy as np
 import cv2
 import io
 from PIL import Image
-import torch
-import torchvision.transforms as transforms
-from torchvision.models import resnet18
 from fastapi.responses import StreamingResponse
 from reportlab.lib.pagesizes import letter
 from reportlab.pdfgen import canvas
 import io as sysio
 import os
-from app.models import train_cnn_model, predict_cnn_model, direct_image_comparison
-from torchvision import transforms
+from app.face_embedding import get_face_embedding, cosine_similarity
 
 app = FastAPI()
-
-# Inicializar modelo ResNet18 preentrenado (sin la última capa)
-resnet_model = resnet18(pretrained=True)
-resnet_model.eval()
-# Quitar la última capa (fc) para obtener el embedding
-resnet_model = torch.nn.Sequential(*list(resnet_model.children())[:-1])
-
-# Transformaciones para preprocesar la imagen
-preprocess = transforms.Compose([
-    transforms.Resize((224, 224)),
-    transforms.ToTensor(),
-    transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225]),
-])
 
 @app.get("/")
 def read_root():
@@ -74,44 +57,25 @@ async def registrar_alumno(
     image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
     image_np = np.array(image)
     image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-    # Cargar el clasificador Haar
-    cascade_path = "models/haarcascade_frontalface_default.xml"
-    face_cascade = cv2.CascadeClassifier(cascade_path)
-    # Detectar rostros
-    faces = face_cascade.detectMultiScale(image_cv, scaleFactor=1.1, minNeighbors=5)
-    if len(faces) == 0:
-        raise HTTPException(status_code=400, detail="No se detectó ningún rostro en la imagen.")
-    # Tomar el primer rostro detectado
-    (x, y, w, h) = faces[0]
-    rostro = image_cv[y:y+h, x:x+w]
-    # Guardar 5 imágenes augmentadas en app/alumnos_img/{codigo}/
+    # Extraer embedding facial
+    embedding = get_face_embedding(image_cv)
+    if embedding is None:
+        raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial. Asegúrate de que el rostro esté bien visible y centrado.")
+    embedding_bytes = embedding.astype(np.float32).tobytes()
+    # Guardar imágenes preprocesadas augmentadas en app/alumnos_img/{codigo}/
     img_dir = os.path.join("app", "alumnos_img", codigo)
     os.makedirs(img_dir, exist_ok=True)
-    # Definir transformaciones de augmentation (más suaves)
-    augmentation = transforms.Compose([
-        transforms.RandomResizedCrop(224, scale=(0.9, 1.0)),
-        transforms.RandomHorizontalFlip(),
-        transforms.RandomRotation(10),
-        transforms.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2, hue=0.05),
-        transforms.RandomAffine(degrees=0, translate=(0.05, 0.05), shear=5),
-        transforms.GaussianBlur(3, sigma=(0.1, 0.5)),
-        transforms.ToTensor(),
-    ])
-    for i in range(1, 4):
-        rostro_pil = Image.fromarray(cv2.cvtColor(rostro, cv2.COLOR_BGR2RGB))
-        img_aug = augmentation(rostro_pil)
-        img_aug_pil = transforms.ToPILImage()(img_aug)
-        img_path = os.path.join(img_dir, f"{i}.jpg")
-        img_aug_pil.save(img_path)
-    # Entrenar el modelo CNN con todas las imágenes
-    model_dir = os.path.join("app", "modelos")
-    os.makedirs(model_dir, exist_ok=True)
-    model_path = os.path.join(model_dir, "modelo_cnn.pth")
-    train_cnn_model("app/alumnos_img", model_path, epochs=25)
-    # Guardar en la base de datos (foto y embedding vacío)
-    _, buffer = cv2.imencode('.jpg', rostro)
+    # Guardar la imagen original (opcional)
+    original_path = os.path.join(img_dir, "original.jpg")
+    cv2.imwrite(original_path, image_cv)
+    # Entrenar el modelo CNN (opcional, puedes comentar si solo usas embeddings)
+    # model_dir = os.path.join("app", "modelos")
+    # os.makedirs(model_dir, exist_ok=True)
+    # model_path = os.path.join(model_dir, "modelo_cnn.pth")
+    # train_cnn_model("app/alumnos_img", model_path, epochs=25)
+    # Guardar en la base de datos (foto original y embedding)
+    _, buffer = cv2.imencode('.jpg', image_cv)
     rostro_bytes = buffer.tobytes()
-    embedding = b''  # No se usa embedding, pero se mantiene el campo
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -119,11 +83,11 @@ async def registrar_alumno(
             INSERT INTO alumnos (nombre, apellido, codigo, correo, foto, embedding)
             VALUES (%s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (nombre, apellido, codigo, correo, rostro_bytes, embedding))
+        cursor.execute(sql, (nombre, apellido, codigo, correo, rostro_bytes, embedding_bytes))
         conn.commit()
         cursor.close()
         conn.close()
-        return {"success": True, "message": "Alumno registrado correctamente"}
+        return {"success": True, "message": "Alumno registrado correctamente con embedding facial"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -267,93 +231,55 @@ async def pasar_asistencia(sesion_id: int, foto: UploadFile = File(...)):
             return {"success": False, "message": "No se puede pasar asistencia. La sesión ya está finalizada."}
         cursor.close()
         conn.close()
+        
         # Leer la foto como bytes
         foto_bytes = await foto.read()
         image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
         image_np = np.array(image)
         image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-        cascade_path = "models/haarcascade_frontalface_default.xml"
-        face_cascade = cv2.CascadeClassifier(cascade_path)
-        faces = face_cascade.detectMultiScale(image_cv, scaleFactor=1.1, minNeighbors=5)
-        if len(faces) == 0:
-            raise HTTPException(status_code=400, detail="No se detectó ningún rostro en la imagen.")
-        (x, y, w, h) = faces[0]
-        rostro = image_cv[y:y+h, x:x+w]
-        # Guardar rostro temporalmente
-        temp_path = os.path.join("app", "alumnos_img", "temp.jpg")
-        cv2.imwrite(temp_path, rostro)
-        
-        # Estrategia híbrida: Comparación directa + CNN como respaldo
-        codigo_predicho = None
-        prob = 0.0
-        metodo_usado = "Ninguno"
-        
-        # 1. Intentar comparación directa
-        try:
-            codigo_directo, score_directo, metodo_directo = direct_image_comparison(temp_path, "app/alumnos_img")
-            if codigo_directo and isinstance(score_directo, (int, float)) and float(score_directo) > 0.75:  # Umbral más estricto para SSIM
-                codigo_predicho = codigo_directo
-                prob = float(score_directo)
-                metodo_usado = f"Comparación directa ({metodo_directo})"
-        except Exception as e:
-            print(f"Error en comparación directa: {e}")
-        
-        # 2. Si comparación directa no funcionó, usar CNN
-        if not codigo_predicho:
-            model_path = os.path.join("app", "modelos", "modelo_cnn.pth")
-            if os.path.exists(model_path):
-                try:
-                    codigo_cnn, prob_cnn = predict_cnn_model(temp_path, model_path)
-                    if isinstance(prob_cnn, (int, float)) and float(prob_cnn) > 0.5:  # Umbral más bajo para CNN
-                        codigo_predicho = codigo_cnn
-                        prob = float(prob_cnn)
-                        metodo_usado = "Modelo CNN"
-                except Exception as e:
-                    print(f"Error en predicción CNN: {e}")
-        
-        os.remove(temp_path)
-        
-        if not codigo_predicho or not isinstance(prob, (int, float)) or float(prob) < 0.5:
-            return {"success": False, "message": "No se pudo identificar al alumno con suficiente confianza."}
-        
-        # Buscar el alumno por código y marcar asistencia
-        conn = get_connection()
+        # Extraer embedding facial de la imagen de prueba
+        test_embedding = get_face_embedding(image_cv)
+        if test_embedding is None:
+            raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial de la imagen de asistencia.")
+        # Buscar todos los alumnos y comparar embeddings
         cursor = conn.cursor()
-        cursor.execute("SELECT id, nombre FROM alumnos WHERE codigo = %s", (codigo_predicho,))
-        alumno = cursor.fetchone()
-        if not alumno:
-            cursor.close()
-            conn.close()
-            return {"success": False, "message": "Alumno identificado no encontrado en la base de datos."}
-        alumno_id, nombre = alumno
-        # Solo permite int, str o float para conversión segura
-        if not isinstance(alumno_id, (int, str, float)) or not isinstance(sesion_id, (int, str, float)):
-            cursor.close()
-            conn.close()
-            raise HTTPException(status_code=500, detail="ID de alumno o sesión no convertible a entero")
-        try:
-            alumno_id_final = int(alumno_id)
-            sesion_id_final = int(sesion_id)
-        except Exception:
-            cursor.close()
-            conn.close()
-            raise HTTPException(status_code=500, detail="ID de alumno o sesión no convertible a entero")
-        cursor.execute('''
+        cursor.execute("SELECT id, nombre, codigo, embedding FROM alumnos")
+        alumnos = cursor.fetchall()
+        best_score = -1
+        best_alumno = None
+        for alumno in alumnos:
+            alumno_id, nombre, codigo, emb_blob = alumno
+            if emb_blob is None:
+                continue
+            emb_np = np.frombuffer(emb_blob, dtype=np.float32)
+            if emb_np.shape[0] != test_embedding.shape[0]:
+                continue
+            score = cosine_similarity(test_embedding, emb_np)
+            if score > best_score:
+                best_score = score
+                best_alumno = (alumno_id, nombre, codigo)
+        # Umbral de similitud (ajustable, típico: 0.5-0.6)
+        if best_score < 0.5 or best_alumno is None:
+            return {"success": False, "message": "No se pudo identificar al alumno con suficiente confianza."}
+        alumno_id, nombre, codigo = best_alumno
+        # Marcar asistencia
+        conn2 = get_connection()
+        cursor2 = conn2.cursor()
+        cursor2.execute('''
             UPDATE asistencias SET estado = 'Asistió'
             WHERE sesion_id = %s AND alumno_id = %s
-        ''', (sesion_id_final, alumno_id_final))
-        conn.commit()
-        cursor.close()
-        conn.close()
+        ''', (sesion_id, alumno_id))
+        conn2.commit()
+        cursor2.close()
+        conn2.close()
         return {
             "success": True,
-            "message": "Asistencia registrada",
+            "message": "Asistencia registrada con embedding facial",
             "alumno": {
-                "id": alumno_id_final,
+                "id": alumno_id,
                 "nombre": nombre,
-                "codigo": codigo_predicho,
-                "probabilidad": prob,
-                "metodo": metodo_usado
+                "codigo": codigo,
+                "similitud": float(best_score)
             }
         }
     except Exception as e:
@@ -460,29 +386,26 @@ async def editar_alumno(
             image = Image.open(io.BytesIO(foto_bytes)).convert("RGB")
             image_np = np.array(image)
             image_cv = cv2.cvtColor(image_np, cv2.COLOR_RGB2BGR)
-            cascade_path = "models/haarcascade_frontalface_default.xml"
-            face_cascade = cv2.CascadeClassifier(cascade_path)
-            faces = face_cascade.detectMultiScale(image_cv, scaleFactor=1.1, minNeighbors=5)
-            if len(faces) == 0:
-                raise HTTPException(status_code=400, detail="No se detectó ningún rostro en la imagen.")
-            (x, y, w, h) = faces[0]
-            rostro = image_cv[y:y+h, x:x+w]
-            _, buffer = cv2.imencode('.jpg', rostro)
+            # Extraer embedding facial
+            embedding = get_face_embedding(image_cv)
+            if embedding is None:
+                raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial de la nueva foto.")
+            embedding_bytes = embedding.astype(np.float32).tobytes()
+            _, buffer = cv2.imencode('.jpg', image_cv)
             rostro_bytes = buffer.tobytes()
-            rostro_rgb = cv2.cvtColor(rostro, cv2.COLOR_BGR2RGB)
-            rostro_pil = Image.fromarray(rostro_rgb)
-            rostro_tensor = preprocess(rostro_pil)
-            if not isinstance(rostro_tensor, torch.Tensor):
-                raise HTTPException(status_code=500, detail="Error al convertir la imagen a tensor")
-            rostro_tensor = torch.unsqueeze(rostro_tensor, 0)
-            with torch.no_grad():
-                embedding_tensor = resnet_model(rostro_tensor)
-            embedding_np = embedding_tensor.squeeze().numpy()
-            embedding_bytes = embedding_np.tobytes()
             campos.append("foto=%s")
             valores.append(rostro_bytes)
             campos.append("embedding=%s")
             valores.append(embedding_bytes)
+            # Actualizar la imagen original en la carpeta del alumno
+            cursor.execute("SELECT codigo FROM alumnos WHERE id = %s", (alumno_id,))
+            alumno_result = cursor.fetchone()
+            if alumno_result:
+                codigo_alumno = alumno_result[0]
+                img_dir = os.path.join("app", "alumnos_img", codigo_alumno)
+                os.makedirs(img_dir, exist_ok=True)
+                original_path = os.path.join(img_dir, "original.jpg")
+                cv2.imwrite(original_path, image_cv)
         if not campos:
             cursor.close()
             conn.close()
@@ -493,7 +416,7 @@ async def editar_alumno(
         conn.commit()
         cursor.close()
         conn.close()
-        return {"success": True, "message": "Alumno actualizado correctamente"}
+        return {"success": True, "message": "Alumno actualizado correctamente con embedding facial"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
