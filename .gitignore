@@ -1,9 +1,5 @@
-# Python
 __pycache__/
-*.pyc
-
-# Entorno virtual
-.env
-
-# Imágenes y datos generados en runtime
-app/alumnos_img/
+  *.pyc
+  *.pyo
+  .env
+  app/alumnos_img/

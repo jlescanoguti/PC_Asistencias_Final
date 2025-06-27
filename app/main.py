@@ -10,8 +10,20 @@ from reportlab.pdfgen import canvas
 import io as sysio
 import os
 from app.face_embedding import get_face_embedding, cosine_similarity
+import cloudinary
+import cloudinary.uploader
+from app.cloudinary_config import cloudinary
+from fastapi.middleware.cors import CORSMiddleware
 
 app = FastAPI()
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Permitir todos los orígenes (ajusta en producción si lo deseas)
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 @app.get("/")
 def read_root():
@@ -77,15 +89,10 @@ async def registrar_alumno(
         conn.close()
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
-    # Guardar imágenes preprocesadas augmentadas en app/alumnos_img/{codigo}/
-    img_dir = os.path.join("app", "alumnos_img", codigo)
-    os.makedirs(img_dir, exist_ok=True)
-    # Guardar la imagen original (opcional)
-    original_path = os.path.join(img_dir, "original.jpg")
-    cv2.imwrite(original_path, image_cv)
-    # Guardar en la base de datos (foto original y embedding)
-    _, buffer = cv2.imencode('.jpg', image_cv)
-    rostro_bytes = buffer.tobytes()
+    # Subir la imagen a Cloudinary
+    upload_result = cloudinary.uploader.upload(foto_bytes, folder=f"alumnos/{codigo}")
+    url_imagen = upload_result["secure_url"]
+    # Guardar en la base de datos (URL de la imagen y embedding)
     try:
         conn = get_connection()
         cursor = conn.cursor()
@@ -93,11 +100,11 @@ async def registrar_alumno(
             INSERT INTO alumnos (nombre, apellido, codigo, correo, foto, embedding)
             VALUES (%s, %s, %s, %s, %s, %s)
         """
-        cursor.execute(sql, (nombre, apellido, codigo, correo, rostro_bytes, embedding_bytes))
+        cursor.execute(sql, (nombre, apellido, codigo, correo, url_imagen, embedding_bytes))
         conn.commit()
         cursor.close()
         conn.close()
-        return {"success": True, "message": "Alumno registrado correctamente con embedding facial"}
+        return {"success": True, "message": "Alumno registrado correctamente con embedding facial y foto en la nube"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
@@ -406,21 +413,13 @@ async def editar_alumno(
             if embedding is None:
                 raise HTTPException(status_code=400, detail="No se pudo extraer el embedding facial de la nueva foto.")
             embedding_bytes = embedding.astype(np.float32).tobytes()
-            _, buffer = cv2.imencode('.jpg', image_cv)
-            rostro_bytes = buffer.tobytes()
+            # Subir la nueva imagen a Cloudinary
+            upload_result = cloudinary.uploader.upload(foto_bytes, folder=f"alumnos/{codigo if codigo is not None else alumno_id}")
+            url_imagen = upload_result["secure_url"]
             campos.append("foto=%s")
-            valores.append(rostro_bytes)
+            valores.append(url_imagen)
             campos.append("embedding=%s")
             valores.append(embedding_bytes)
-            # Actualizar la imagen original en la carpeta del alumno
-            cursor.execute("SELECT codigo FROM alumnos WHERE id = %s", (alumno_id,))
-            alumno_result = cursor.fetchone()
-            if alumno_result:
-                codigo_alumno = alumno_result[0]
-                img_dir = os.path.join("app", "alumnos_img", codigo_alumno)
-                os.makedirs(img_dir, exist_ok=True)
-                original_path = os.path.join(img_dir, "original.jpg")
-                cv2.imwrite(original_path, image_cv)
         if not campos:
             cursor.close()
             conn.close()
@@ -431,7 +430,7 @@ async def editar_alumno(
         conn.commit()
         cursor.close()
         conn.close()
-        return {"success": True, "message": "Alumno actualizado correctamente con embedding facial"}
+        return {"success": True, "message": "Alumno actualizado correctamente con embedding facial y foto en la nube"}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
 
