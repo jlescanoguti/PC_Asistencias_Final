@@ -1,0 +1,12 @@
+fastapi
+uvicorn
+Pillow
+mysql-connector-python
+python-multipart
+opencv-python-headless
+numpy
+python-dotenv
+reportlab
+insightface
+onnxruntime
+cloudinary
