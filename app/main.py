@@ -509,3 +509,16 @@ def listar_asistencias_alumno(alumno_id: int):
         return {"success": True, "asistencias": asistencias}
     except Exception as e:
         raise HTTPException(status_code=400, detail=str(e))
+
+@app.get("/alumnos")
+def listar_alumnos():
+    try:
+        conn = get_connection()
+        cursor = conn.cursor(dictionary=True)
+        cursor.execute("SELECT id, nombre, apellido, codigo, correo, foto FROM alumnos ORDER BY id ASC")
+        alumnos = cursor.fetchall()
+        cursor.close()
+        conn.close()
+        return {"success": True, "alumnos": alumnos}
+    except Exception as e:
+        raise HTTPException(status_code=400, detail=str(e))
